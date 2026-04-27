@@ -2209,6 +2209,12 @@ llm_graph_cb llama_context::graph_get_cb() const {
         // norm may be automatically assigned to the backend of the previous layer, increasing data transfer between backends
         // FIXME: fix in ggml_backend_sched
         const bool full_offload = model.n_gpu_layers() > model.hparams.n_layer;
+        // XDNA_SCHED: trace graph_get_cb invocations for "norm" tensors to see ubatch.n_tokens at graph-build time
+        static const bool xdna_sched_trace = (getenv("GGML_XDNA_SCHED_TRACE") != nullptr);
+        if (xdna_sched_trace && il != -1 && strcmp(name, "norm") == 0) {
+            fprintf(stderr, "[XDNA_SCHED graph_get_cb] name=norm il=%d ubatch.n_tokens=%u full_offload=%d will_pin=%d\n",
+                il, ubatch.n_tokens, (int)full_offload, (int)(ubatch.n_tokens < 32 || full_offload));
+        }
         if (ubatch.n_tokens < 32 || full_offload) {
             if (il != -1 && strcmp(name, "norm") == 0) {
                 const auto & dev_layer = model.dev_layer(il);

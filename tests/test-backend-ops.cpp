@@ -1413,8 +1413,9 @@ struct test_case {
             }
 
             double err = ud->tc->err(f1.data(), f2.data(), f1.size());
+            printf("[%s] err=%.3e (tol=%.3e) ", ggml_op_desc(t1), err, ud->tc->max_err(ud->backend1));
             if (err > ud->tc->max_err(ud->backend1)) {
-                printf("[%s] ERR = %.9f > %.9f ", ggml_op_desc(t1), err, ud->tc->max_err(ud->backend1));
+                printf(">> FAIL ");
                 //for (int i = 0; i < (int) f1.size(); i++) {
                 //    printf("%5d %9.6f %9.6f, diff = %9.6f\n", i, f1[i], f2[i], f1[i] - f2[i]);
                 //}
@@ -2060,6 +2061,13 @@ struct test_glu_split : public test_case {
             std::array<int64_t, 4> ne_a = {128, 2, 2, 2},
             int v = 0)
         : op(op), type(type), ne_a(ne_a), v(v) {}
+
+    double max_nmse_err(ggml_backend_t backend) override {
+        if (backend_has_feature(backend, "BF16_PRECISION")) {
+            return 5e-4;
+        }
+        return test_case::max_nmse_err();
+    }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a;
@@ -2998,6 +3006,15 @@ struct test_bin_bcast : public test_case {
             bool perm1 = false, bool src_overlap = false)
         : op(op), type(type), ne(ne), nr(nr), nf(nf), perm1(perm1), src_overlap(src_overlap) {}
 
+    double max_nmse_err(ggml_backend_t backend) override {
+        // Backends that round-trip element-wise ops through BF16 internally
+        // (e.g. ggml-xdna) can't meet the default 1e-7 against an F32 ref.
+        if (backend_has_feature(backend, "BF16_PRECISION")) {
+            return 5e-4;
+        }
+        return test_case::max_nmse_err();
+    }
+
     ggml_tensor * build_graph(ggml_context * ctx) override {
         GGML_ASSERT(nf <= 16);
 
@@ -3327,6 +3344,13 @@ struct test_rms_norm : public test_case {
             float eps = 1e-6f,
             bool inplace = false)
         : type(type), ne(ne), v(v), eps(eps), inplace(inplace) {}
+
+    double max_nmse_err(ggml_backend_t backend) override {
+        if (backend_has_feature(backend, "BF16_PRECISION")) {
+            return 5e-4;
+        }
+        return test_case::max_nmse_err();
+    }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne.data());
@@ -4713,6 +4737,13 @@ struct test_rope : public test_case {
 
     double max_maa_err() override {
         return 1e-3;
+    }
+
+    double max_nmse_err(ggml_backend_t backend) override {
+        if (backend_has_feature(backend, "BF16_PRECISION")) {
+            return 5e-4;
+        }
+        return test_case::max_nmse_err();
     }
 
     bool grad_precise() override {
@@ -7895,6 +7926,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_bin_bcast(ggml_add, GGML_TYPE_F32, {10, 5, 4, 3}, {1, 2, 2, 2}, 7));
     test_cases.emplace_back(new test_bin_bcast(ggml_add, GGML_TYPE_F32, {16, 5, 4, 3}, {2, 2, 2, 2}, 8));
     test_cases.emplace_back(new test_bin_bcast(ggml_add, GGML_TYPE_F32, {16, 5, 4, 3}, {1, 1, 1, 1}, 16));
+    // ggml-xdna ADD shape: residual at Llama-3.2-1B M=256 prefill, no broadcast.
+    test_cases.emplace_back(new test_bin_bcast(ggml_add, GGML_TYPE_F32, {2048, 256, 1, 1}, {1, 1, 1, 1}, 1));
+    // ggml-xdna MUL shapes: same-shape (FFN gate*up) and row-broadcast
+    // (RMSNorm gamma) at Llama-3.2-1B M=256 prefill.
+    test_cases.emplace_back(new test_bin_bcast(ggml_mul, GGML_TYPE_F32, {8192, 256, 1, 1}, {1, 1, 1, 1}, 1));
+    test_cases.emplace_back(new test_bin_bcast(ggml_mul, GGML_TYPE_F32, {2048,   1, 1, 1}, {1, 256, 1, 1}, 1));
+    // ggml-xdna GLU(swiglu) shape: Llama FFN gate at M=256 prefill — silu(gate) * up
+    // dispatched as two chained NPU calls under one ggml_glu_split node.
+    test_cases.emplace_back(new test_glu_split(GGML_GLU_OP_SWIGLU, GGML_TYPE_F32, {8192, 256, 1, 1}));
+    // Decode-shape (M=1) variants of the same ops.
+    test_cases.emplace_back(new test_bin_bcast(ggml_add, GGML_TYPE_F32, {2048, 1, 1, 1}, {1, 1, 1, 1}, 1));
+    test_cases.emplace_back(new test_bin_bcast(ggml_mul, GGML_TYPE_F32, {2048, 1, 1, 1}, {1, 1, 1, 1}, 1));
+    test_cases.emplace_back(new test_bin_bcast(ggml_mul, GGML_TYPE_F32, {8192, 1, 1, 1}, {1, 1, 1, 1}, 1));
+    test_cases.emplace_back(new test_glu_split(GGML_GLU_OP_SWIGLU, GGML_TYPE_F32, {8192, 1, 1, 1}));
 
     test_cases.emplace_back(new test_scale());
     test_cases.emplace_back(new test_scale(GGML_TYPE_F32, {10, 10, 10, 10}, 2.0f, 1.0f));
@@ -7917,6 +7962,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // in-place tests
     test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {64, 5, 4, 3}, false, 1e-6f, true));
+    // ggml-xdna RMS_NORM shape: Llama-3.2-1B M=256 prefill activation,
+    // (2048, 256, 1, 1) F32 with eps=1e-5 (matches IRON's compile-time eps).
+    test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {2048, 256, 1, 1}, false, 1e-5f, false));
 
     for (float eps : { 0.0f, 1e-6f, 1e-4f, 1e-1f, 1.0f }) {
         for (uint32_t n : { 64, 1025 }) {
@@ -8064,10 +8112,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat(type_a, type_b, 16, 8, 256, {1536, 1}, {1, 1}));
         }
     }
-    // BF16 x BF16 -> F32 at the shape ggml-xdna's first GEMM kernel covers
-    // (M=K=N=2048). Useful as a real-size sanity check against the CPU
-    // reference for any backend that ships a BF16 GEMM.
-    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_BF16, 2048, 2048, 2048, {1, 1}, {1, 1}));
+    // BF16 x BF16 -> F32 at shapes ggml-xdna's GEMM kernels cover for
+    // Llama-3.2-1B prefill at a 256-token batch. test_mul_mat's m, n, k
+    // arguments map to (a.ne[1], b.ne[1], a.ne[0]) i.e. (N, M, K) in
+    // dispatch terminology.
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_BF16, 2048, 2048, 2048, {1, 1}, {1, 1})); // 2048^3 reference
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_BF16, 2048,  256, 2048, {1, 1}, {1, 1})); // Q/O proj
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_BF16,  512,  256, 2048, {1, 1}, {1, 1})); // K/V proj
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_BF16, 8192,  256, 2048, {1, 1}, {1, 1})); // FFN gate/up
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_BF16, 2048,  256, 8192, {1, 1}, {1, 1})); // FFN down
+    // Decode-shape (n=1) cases — exercise ggml-xdna's GEMV path. FFN-down
+    // (k=8192) and lm_head (m=128256) intentionally absent: the former
+    // doesn't fit AIE2p L1 under the current GEMV design, the latter is
+    // deferred until async overlap closes the dispatch-overhead gap to CPU.
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_BF16, 2048,    1, 2048, {1, 1}, {1, 1})); // Q/O proj decode
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_BF16,  512,    1, 2048, {1, 1}, {1, 1})); // K/V proj decode
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_BF16, 8192,    1, 2048, {1, 1}, {1, 1})); // FFN gate/up decode
     for (ggml_type type_a : other_types) {
         for (ggml_type type_b : {GGML_TYPE_F32}) {
             if (ggml_blck_size(type_a) != 256) {
@@ -8366,6 +8426,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                     test_cases.emplace_back(new test_rope(type, {128,  52, 2, 1}, 128, GGML_ROPE_TYPE_NORMAL, 512, fs, ef, af, ff, v, fw)); // llama 30B
                                     test_cases.emplace_back(new test_rope(type, {128,  64, 2, 1}, 128, GGML_ROPE_TYPE_NORMAL, 512, fs, ef, af, ff, v, fw)); // llama 65B
                                     test_cases.emplace_back(new test_rope(type, {16, 16, 8192, 1}, 16, GGML_ROPE_TYPE_NORMAL, 512, fs, ef, af, ff, v, fw));
+                                    test_cases.emplace_back(new test_rope(type, { 64,  32, 256, 1},  64, GGML_ROPE_TYPE_NORMAL, 512, fs, ef, af, ff, v, fw)); // llama-3.2-1B Q prefill
+                                    test_cases.emplace_back(new test_rope(type, { 64,   8, 256, 1},  64, GGML_ROPE_TYPE_NORMAL, 512, fs, ef, af, ff, v, fw)); // llama-3.2-1B K prefill
                                 }
 
                                 if (all) {

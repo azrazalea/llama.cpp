@@ -874,12 +874,23 @@ static char causes[GGML_DEFAULT_GRAPH_SIZE*16 + GGML_SCHED_MAX_SPLITS_DEBUG*GGML
 #define GET_CAUSE(node) ""
 #endif
 
+// XDNA scheduler trace toggle. Initialized once from GGML_XDNA_SCHED_TRACE.
+static bool xdna_sched_trace_enabled() {
+    static const bool enabled = (getenv("GGML_XDNA_SCHED_TRACE") != nullptr);
+    return enabled;
+}
+#define XDNA_SCHED_TRACE(...) do { if (xdna_sched_trace_enabled()) { fprintf(stderr, __VA_ARGS__); } } while (0)
+
 // returns the backend that should be used for the node based on the current locations
 static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, struct ggml_tensor * tensor) {
     // assign pre-allocated nodes to their backend
     int cur_backend_id = ggml_backend_sched_backend_from_buffer(sched, tensor, tensor);
     if (cur_backend_id != -1) {
         SET_CAUSE(tensor, "1.dst");
+        // XDNA_TRACE: RMS_NORM exited via 1.dst
+        if (tensor->op == GGML_OP_RMS_NORM) {
+            XDNA_SCHED_TRACE("[XDNA_SCHED from_cur] RMS_NORM %s -> 1.dst bid=%d\n", tensor->name, cur_backend_id);
+        }
         return cur_backend_id;
     }
 
@@ -888,6 +899,10 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
         cur_backend_id = ggml_backend_sched_backend_from_buffer(sched, tensor->view_src, tensor);
         if (cur_backend_id != -1) {
             SET_CAUSE(tensor, "1.vsrc");
+            // XDNA_TRACE: RMS_NORM exited via 1.vsrc
+            if (tensor->op == GGML_OP_RMS_NORM) {
+                XDNA_SCHED_TRACE("[XDNA_SCHED from_cur] RMS_NORM %s -> 1.vsrc bid=%d\n", tensor->name, cur_backend_id);
+            }
             return cur_backend_id;
         }
     }
@@ -902,6 +917,10 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
     if (tensor->flags & GGML_TENSOR_FLAG_INPUT) {
         cur_backend_id = sched->n_backends - 1; // last backend (assumed CPU)
         SET_CAUSE(tensor, "1.inp");
+        // XDNA_TRACE: RMS_NORM exited via 1.inp (marked GGML_TENSOR_FLAG_INPUT)
+        if (tensor->op == GGML_OP_RMS_NORM) {
+            XDNA_SCHED_TRACE("[XDNA_SCHED from_cur] RMS_NORM %s -> 1.inp (INPUT flag) bid=%d\n", tensor->name, cur_backend_id);
+        }
         return cur_backend_id;
     }
 
@@ -920,12 +939,34 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
                 for (int b = 0; b < src_backend_id; b++) {
                     if (ggml_backend_supports_op(sched->backends[b], tensor) && ggml_backend_offload_op(sched->backends[b], tensor)) {
                         SET_CAUSE(tensor, "1.off");
+                        // XDNA_TRACE: RMS_NORM exited via 1.off (offloaded via weight src)
+                        if (tensor->op == GGML_OP_RMS_NORM) {
+                            XDNA_SCHED_TRACE("[XDNA_SCHED from_cur] RMS_NORM %s -> 1.off bid=%d (src[%d]=%s is weight)\n",
+                                tensor->name, b, i, src->name);
+                        }
                         return b;
                     }
                 }
             }
             SET_CAUSE(tensor, "1.wgt%d", i);
+            // XDNA_TRACE: RMS_NORM exited via 1.wgt (pinned to weight src backend)
+            if (tensor->op == GGML_OP_RMS_NORM) {
+                XDNA_SCHED_TRACE("[XDNA_SCHED from_cur] RMS_NORM %s -> 1.wgt%d bid=%d (src=%s usage=%d)\n",
+                    tensor->name, i, src_backend_id, src->name, (int)src->buffer->usage);
+            }
             return src_backend_id;
+        }
+    }
+
+    // XDNA_TRACE: RMS_NORM fell through to -1 (no weight src, no buf, no INPUT flag)
+    if (tensor->op == GGML_OP_RMS_NORM) {
+        XDNA_SCHED_TRACE("[XDNA_SCHED from_cur] RMS_NORM %s -> -1 (unresolved in pass1)\n", tensor->name);
+        for (int i = 0; i < GGML_MAX_SRC; i++) {
+            const struct ggml_tensor * src = tensor->src[i];
+            if (src == NULL) break;
+            XDNA_SCHED_TRACE("[XDNA_SCHED from_cur]   src[%d]=%s op=%s buf=%p usage=%d flags=0x%x\n",
+                i, src->name, ggml_op_name(src->op), (void*)src->buffer,
+                src->buffer ? (int)src->buffer->usage : -1, src->flags);
         }
     }
 
@@ -1040,15 +1081,45 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         if (*leaf_backend_id == -1) {
             *leaf_backend_id = ggml_backend_sched_backend_id_from_cur(sched, leaf);
         }
+        // XDNA_TRACE: log all leafs briefly (op, name, bid)
+        XDNA_SCHED_TRACE("[XDNA_SCHED leaf] i=%d op=%s name=%s bid=%d buf=%p usage=%d flags=0x%x\n",
+            i, ggml_op_name(leaf->op), leaf->name, *leaf_backend_id,
+            (void*)leaf->buffer, leaf->buffer ? (int)leaf->buffer->usage : -1, leaf->flags);
     }
 
     for (int i = 0; i < graph->n_nodes; i++) {
         struct ggml_tensor * node = graph->nodes[i];
         int * node_backend_id = &tensor_backend_id(node);
         // do not overwrite user assignments
+        // XDNA_TRACE: log pre-assigned RMS_NORM
+        if (*node_backend_id != -1 && node->op == GGML_OP_RMS_NORM) {
+            XDNA_SCHED_TRACE("[XDNA_SCHED pass1_preassign] i=%d op=%s name=%s pre_bid=%d buf=%p flags=0x%x\n",
+                i, ggml_op_name(node->op), node->name, *node_backend_id,
+                (void*)node->buffer, node->flags);
+        }
         if (*node_backend_id == -1) {
             *node_backend_id = ggml_backend_sched_backend_id_from_cur(sched, node);
-
+            // XDNA_TRACE: log pass-1 assignment for RMS_NORM and neighbors
+            {
+                bool near = false;
+                for (int di = -3; di <= 3; di++) {
+                    int ni = i + di;
+                    if (ni >= 0 && ni < graph->n_nodes && graph->nodes[ni]->op == GGML_OP_RMS_NORM) {
+                        near = true; break;
+                    }
+                }
+                if (near || node->op == GGML_OP_RMS_NORM) {
+                    XDNA_SCHED_TRACE("[XDNA_SCHED pass1] i=%d op=%s name=%s assigned_bid=%d\n",
+                        i, ggml_op_name(node->op), node->name, *node_backend_id);
+                    for (int j = 0; j < GGML_MAX_SRC; j++) {
+                        if (node->src[j] == NULL) break;
+                        int sbid = tensor_backend_id(node->src[j]);
+                        int usage = node->src[j]->buffer ? (int)node->src[j]->buffer->usage : -1;
+                        XDNA_SCHED_TRACE("[XDNA_SCHED pass1]   src[%d]=%s bid=%d buf=%p usage=%d\n",
+                            j, node->src[j]->name, sbid, (void*)node->src[j]->buffer, usage);
+                    }
+                }
+            }
 #if 0
             // src
             if (node->op == GGML_OP_NONE) {
@@ -1083,6 +1154,20 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 continue;
             }
             int * node_backend_id = &tensor_backend_id(node);
+            // XDNA_TRACE: log nodes near RMS_NORM
+            {
+                bool near = false;
+                for (int di = -3; di <= 3; di++) {
+                    int ni = i + di;
+                    if (ni >= 0 && ni < graph->n_nodes && graph->nodes[ni]->op == GGML_OP_RMS_NORM) {
+                        near = true; break;
+                    }
+                }
+                if (near || node->op == GGML_OP_RMS_NORM) {
+                    XDNA_SCHED_TRACE("[XDNA_SCHED expand_gpu_down] i=%d op=%s name=%s node_bid=%d cur_backend_id=%d n_backends=%d\n",
+                        i, ggml_op_name(node->op), node->name, *node_backend_id, cur_backend_id, sched->n_backends);
+                }
+            }
             if (*node_backend_id != -1) {
                 if (*node_backend_id == sched->n_backends - 1) {
                     // skip cpu (lowest prio backend)
@@ -1101,9 +1186,30 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         for (int i = graph->n_nodes - 1; i >= 0; i--) {
             struct ggml_tensor * node = graph->nodes[i];
             if (ggml_is_view_op(node->op)) {
+                // XDNA_TRACE: view op skipped
+                if (node->op == GGML_OP_VIEW || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE) {
+                    int prev_bid = tensor_backend_id(node);
+                    int src0_bid = node->src[0] ? tensor_backend_id(node->src[0]) : -99;
+                    XDNA_SCHED_TRACE("[XDNA_SCHED expand_gpu_up] SKIP view_op i=%d op=%s name=%s node_bid=%d src0_bid=%d cur_backend_id=%d\n",
+                        i, ggml_op_name(node->op), node->name, prev_bid, src0_bid, cur_backend_id);
+                }
                 continue;
             }
             int * node_backend_id = &tensor_backend_id(node);
+            // XDNA_TRACE: log nodes near RMS_NORM
+            {
+                bool near = false;
+                for (int di = -3; di <= 3; di++) {
+                    int ni = i + di;
+                    if (ni >= 0 && ni < graph->n_nodes && graph->nodes[ni]->op == GGML_OP_RMS_NORM) {
+                        near = true; break;
+                    }
+                }
+                if (near || node->op == GGML_OP_RMS_NORM) {
+                    XDNA_SCHED_TRACE("[XDNA_SCHED expand_gpu_up] i=%d op=%s name=%s node_bid=%d cur_backend_id=%d n_backends=%d\n",
+                        i, ggml_op_name(node->op), node->name, *node_backend_id, cur_backend_id, sched->n_backends);
+                }
+            }
             if (*node_backend_id != -1) {
                 if (*node_backend_id == sched->n_backends - 1) {
                     // skip cpu (lowest prio backend)
