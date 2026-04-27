@@ -8064,6 +8064,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat(type_a, type_b, 16, 8, 256, {1536, 1}, {1, 1}));
         }
     }
+    // BF16 x BF16 -> F32 at the shape ggml-xdna's first GEMM kernel covers
+    // (M=K=N=2048). Useful as a real-size sanity check against the CPU
+    // reference for any backend that ships a BF16 GEMM.
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_BF16, 2048, 2048, 2048, {1, 1}, {1, 1}));
     for (ggml_type type_a : other_types) {
         for (ggml_type type_b : {GGML_TYPE_F32}) {
             if (ggml_blck_size(type_a) != 256) {
